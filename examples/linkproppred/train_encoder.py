@@ -180,21 +180,33 @@ def train(
     opt: torch.optim.Optimizer,
     conversion_rate: int,
 ) -> Tuple[float, torch.Tensor]:
-    # updating z only when the current batch crosses the next snapshot boundary
     encoder.train()
     decoder.train()
     total_loss = 0.0
     total_count = 0
+
     static_node_feats = loader.dgraph.static_node_x
 
     snapshots_iterator = iter(snapshots_loader)
-    snapshot_batch = next(snapshots_iterator)
+    try:
+        snapshot_batch = next(snapshots_iterator)
+    except StopIteration:
+        raise RuntimeError("snapshots_loader is empty; cannot train without snapshots")
 
-    z = encoder(snapshot_batch, static_node_feats)
-    z = z.detach()
+    last_snapshot_batch = snapshot_batch
 
     for batch in tqdm(loader):
+        # move snapshot window forward if needed
+        while batch.edge_time[-1] > (snapshot_batch.edge_time[-1] + 1) * conversion_rate:
+            try:
+                snapshot_batch = next(snapshots_iterator)
+                last_snapshot_batch = snapshot_batch
+            except StopIteration:
+                break
+
         opt.zero_grad()
+
+        z = encoder(snapshot_batch, static_node_feats)
 
         pos_out = decoder(z[batch.edge_src], z[batch.edge_dst])
         neg_out = decoder(z[batch.edge_src], z[batch.neg])
@@ -209,17 +221,14 @@ def train(
         total_loss += float(loss.item()) * bs
         total_count += bs
 
-        while batch.edge_time[-1] > (snapshot_batch.edge_time[-1] + 1) * conversion_rate:
-            try:
-                snapshot_batch = next(snapshots_iterator)
-            except StopIteration:
-                break
-            z = encoder(snapshot_batch, static_node_feats)
-            z = z.detach()
-
     epoch_loss = total_loss / max(total_count, 1)
-    return epoch_loss, z
 
+    # return embeddings for eval
+    encoder.eval()
+    with torch.no_grad():
+        z_eval = encoder(last_snapshot_batch, static_node_feats)
+
+    return epoch_loss, z_eval
 
 
 @log_gpu
@@ -272,14 +281,6 @@ def eval_metrics_full_ranking(
             # scores for all items
             logits = decoder(u_z.expand(int(num_items), -1), items_z).view(-1)
 
-            # filtered full-ranking
-            seen_local = seen_local_by_user[u]     # seen by user u (locals)
-            if seen_local.size > 0:
-                mask = torch.ones(int(num_items), device=device, dtype=torch.bool) # boolean, start with full true
-                mask[torch.from_numpy(seen_local).to(device=device, dtype=torch.long)] = False # set false on seen items for user u
-                mask[pos_local] = True                        # do not mask pos
-                logits = logits.masked_fill(~mask, -float("inf")) # where false set inf to not recommend them
-
             # rank: how many items have score >= pos_score
             pos_score = logits[pos_local]
             rank = int((logits >= pos_score).sum().item())
@@ -292,14 +293,14 @@ def eval_metrics_full_ranking(
 
             # top-K items for coverage
             topk_local = torch.topk(logits, k=k_eff, largest=True).indices  # (k_eff,)
-            topk_global = (topk_local + int(item_offset)).detach().cpu().tolist()
+            topk_global = (topk_local + int(item_offset)).cpu().tolist()
             covered_items.update(topk_global)
 
         # update embeddings if we crossed snapshot boundary
         while batch.edge_time[-1] > (snapshot_batch.edge_time[-1] + 1) * conversion_rate:
             try:
                 snapshot_batch = next(snapshots_iterator)
-                z = encoder(snapshot_batch, static_node_feats).detach()
+                z = encoder(snapshot_batch, static_node_feats)
             except StopIteration:
                 break
 
@@ -406,7 +407,6 @@ seen_train_local = build_seen_local_by_user(df_train_ui, num_users=num_users, it
 df_train_val_ui = df[df["timestamp"] < test_time].copy()
 seen_train_val_local = build_seen_local_by_user(df_train_val_ui, num_users=num_users, item_offset=item_offset)
 
-
 # make bidirectional edges ONLY for snapshots
 df_rev = df.copy()
 df_rev[["from", "to"]] = df_rev[["to", "from"]]
@@ -485,7 +485,6 @@ val_snapshots_loader = DGDataLoader(val_snapshots, batch_unit=args.snapshot_time
 test_snapshots_loader = DGDataLoader(test_snapshots, batch_unit=args.snapshot_time_gran)
 
 
-
 # model
 encoder = GCNEncoder(
     in_channels=train_dg.static_node_x_dim,
@@ -551,7 +550,7 @@ with torch.no_grad():
     last_snapshot_batch = None
     for last_snapshot_batch in train_snapshots_loader:
         pass
-    z = encoder(last_snapshot_batch, static_node_feats).detach()
+    z = encoder(last_snapshot_batch, static_node_feats)
 
 # test
 with hm.activate(test_key):
