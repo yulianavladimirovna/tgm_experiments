@@ -176,9 +176,6 @@ def train_epoch(
 
     # start with empty prefix
     prefix_batch = _update_window_prefix(deque(), device=device)
-    prefix_batch.edge_src = prefix_batch.edge_src
-    prefix_batch.edge_dst = prefix_batch.edge_dst
-    prefix_batch.edge_time = prefix_batch.edge_time
 
     z = encoder(prefix_batch, node_feat)
     prev_prefix_sig = (0, -1)  # сколько снапшотов в окне и какой последний sid
@@ -201,7 +198,8 @@ def train_epoch(
             snap_end = (snap_idx + 1) * int(conversion_rate)    # end time in raw units
 
             if snap_end <= batch_start:
-                window.append((next_snapshot.edge_src, next_snapshot.edge_dst, next_snapshot.edge_time))
+                if W > 0:
+                    window.append((next_snapshot.edge_src, next_snapshot.edge_dst, next_snapshot.edge_time))
                 next_snapshot = None
             else:
                 break
@@ -211,10 +209,6 @@ def train_epoch(
         sig = (len(window), last_sid)
         if sig != prev_prefix_sig:
             prefix_batch = _update_window_prefix(window, device=device)  # works also if window is empty
-            prefix_batch.edge_src = prefix_batch.edge_src.to(device)
-            prefix_batch.edge_dst = prefix_batch.edge_dst.to(device)
-            prefix_batch.edge_time = prefix_batch.edge_time.to(device)
-
             z = encoder(prefix_batch, node_feat)
             prev_prefix_sig = sig
 
@@ -276,10 +270,6 @@ def eval_metrics(
     window: Deque[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = deque(maxlen=max(W, 1))
 
     prefix_batch = _update_window_prefix(deque(), device=device)
-    prefix_batch.edge_src = prefix_batch.edge_src.to(device)
-    prefix_batch.edge_dst = prefix_batch.edge_dst.to(device)
-    prefix_batch.edge_time = prefix_batch.edge_time.to(device)
-
     z = encoder(prefix_batch, node_feat)
     prev_prefix_sig = (0, 0)
 
@@ -299,7 +289,8 @@ def eval_metrics(
             snap_idx = int(next_snapshot.edge_time[-1].item())
             snap_end = (snap_idx + 1) * int(conversion_rate)
             if snap_end <= batch_start:
-                window.append((next_snapshot.edge_src, next_snapshot.edge_dst, next_snapshot.edge_time))
+                if W > 0:
+                    window.append((next_snapshot.edge_src, next_snapshot.edge_dst, next_snapshot.edge_time))
                 next_snapshot = None
             else:
                 break
@@ -308,10 +299,6 @@ def eval_metrics(
         sig = (len(window), last_sid)
         if sig != prev_prefix_sig:
             prefix_batch = _update_window_prefix(window, device=device)
-            prefix_batch.edge_src = prefix_batch.edge_src.to(device)
-            prefix_batch.edge_dst = prefix_batch.edge_dst.to(device)
-            prefix_batch.edge_time = prefix_batch.edge_time.to(device)
-
             z = encoder(prefix_batch, node_feat)
             prev_prefix_sig = sig
 
@@ -343,9 +330,12 @@ def eval_metrics(
     user_means = [float(np.mean(v)) for v in ndcg_by_user.values() ]
     ndcg = float(np.mean(user_means))
 
-    all_topk = torch.cat([t.view(-1) for t in topk_by_user.values()], dim=0)
-    covered = int(torch.unique(all_topk).numel())
-    coverage = float(covered) / float(max(1, int(num_items)))
+    if len(topk_by_user) == 0:
+        coverage = 0.0
+    else:
+        all_topk = torch.cat([t.view(-1) for t in topk_by_user.values()], dim=0)
+        covered = int(torch.unique(all_topk).numel())
+        coverage = float(covered) / float(max(1, int(num_items)))
 
     return {"NDCG": ndcg, "Coverage": coverage}
 
