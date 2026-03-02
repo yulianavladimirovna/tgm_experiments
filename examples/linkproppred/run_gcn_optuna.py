@@ -10,13 +10,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
-from tqdm import tqdm
 
 import optuna
+import logging
+import sys
 
 from tgm import DGBatch, DGraph, TimeDeltaDG
 from tgm.data import DGData, DGDataLoader, TemporalSplit
-from tgm.util.logging import enable_logging, log_gpu, log_latency, log_metric, log_metrics_dict
 from tgm.util.seed import seed_everything
 
 
@@ -138,15 +138,13 @@ def _update_window_prefix(
         edge_dst = torch.empty(0, dtype=torch.long, device=device)
         edge_time = torch.empty(0, dtype=torch.long, device=device)
         return DGBatch(edge_src=edge_src, edge_dst=edge_dst, edge_time=edge_time)
-
-    src = torch.cat([x[0] for x in window], dim=0).to(device)
-    dst = torch.cat([x[1] for x in window], dim=0).to(device)
-    tim = torch.cat([x[2] for x in window], dim=0).to(device)
+    # already on device
+    src = torch.cat([x[0] for x in window], dim=0)
+    dst = torch.cat([x[1] for x in window], dim=0)
+    tim = torch.cat([x[2] for x in window], dim=0)
     return DGBatch(edge_src=src, edge_dst=dst, edge_time=tim)
 
 
-@log_gpu
-@log_latency
 def train_epoch(
     loader: DGDataLoader,
     snapshots_loader: DGDataLoader,
@@ -175,7 +173,9 @@ def train_epoch(
     next_snapshot = None
 
     W = int(window_snapshots)
-    window: Deque[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = deque(maxlen=max(W, 0)) # (edge_src, edge_dst, edge_time)
+    window: Deque[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = deque(
+        maxlen=max(W, 0)
+    )  # (edge_src, edge_dst, edge_time)
 
     prefix_batch = _update_window_prefix(deque(), device=device)
     z = encoder(prefix_batch, node_feat)
@@ -184,7 +184,7 @@ def train_epoch(
     total_loss = 0.0
     total_users = 0
 
-    for batch in tqdm(loader, desc="train", leave=False):
+    for batch in loader:
         batch_start = int(batch.edge_time.min().item())  # raw time (seconds)
 
         # Advance snapshots strictly BEFORE this batch
@@ -234,8 +234,6 @@ def train_epoch(
     return float(total_loss / max(total_users, 1))
 
 
-@log_gpu
-@log_latency
 @torch.no_grad()
 def eval_metrics(
     loader: DGDataLoader,
@@ -276,7 +274,7 @@ def eval_metrics(
     ndcg_by_user: Dict[int, List[float]] = defaultdict(list)
     topk_by_user: Dict[int, torch.Tensor] = {}
 
-    for batch in tqdm(loader, desc="eval", leave=False):
+    for batch in loader:
         batch_start = int(batch.edge_time.min().item())
 
         while True:
@@ -323,7 +321,7 @@ def eval_metrics(
                 ndcg = 1.0 / float(np.log2(rank + 2.0))
             ndcg_by_user[u].append(float(ndcg))
 
-            topk_by_user[u] = topk_idx[row].detach().cpu()
+            topk_by_user[u] = topk_idx[row].detach()
 
     user_means = [float(np.mean(v)) for v in ndcg_by_user.values()]
     ndcg = float(np.mean(user_means)) if len(user_means) else 0.0
@@ -355,6 +353,7 @@ class EarlyStopper:
             self.best = float(value)
             self.best_epoch = int(epoch)
             self.cnt = 0
+            # keep best on CPU
             self.best_encoder_state = {k: v.detach().cpu().clone() for k, v in encoder.state_dict().items()}
             self.best_decoder_state = {k: v.detach().cpu().clone() for k, v in decoder.state_dict().items()}
             self.best_node_emb_state = {k: v.detach().cpu().clone() for k, v in node_emb.state_dict().items()}
@@ -393,6 +392,7 @@ def run_train_val(
     train_loader: DGDataLoader,
     val_loader: DGDataLoader,
     snapshots_loader: DGDataLoader,
+    log_prefix: Optional[str] = None,  # e.g. "trial 3"
 ) -> dict:
     seed_everything(int(seed))
 
@@ -419,10 +419,12 @@ def run_train_val(
     train_total_t0 = time.perf_counter()
     best_val = -1e18
     best_epoch = 0
+    best_val_metrics = {"NDCG": 0.0, "Coverage": 0.0}
+    epochs_ran = 0
 
     for epoch in range(1, int(epochs) + 1):
-
-        _ = train_epoch(
+        epochs_ran = int(epoch)
+        loss = train_epoch(
             train_loader,
             snapshots_loader,
             encoder,
@@ -448,25 +450,41 @@ def run_train_val(
             int(window_snapshots),
         )
 
-        # no-logging
         if float(val["NDCG"]) > best_val:
             best_val = float(val["NDCG"])
             best_epoch = int(epoch)
+            best_val_metrics = {"NDCG": float(val["NDCG"]), "Coverage": float(val["Coverage"])}
+
+        if log_prefix is not None:
+            print(
+                f"{log_prefix} epoch {epoch}: "
+                f"loss={float(loss):.6f} "
+                f"val_NDCG={float(val['NDCG']):.6f} "
+                f"val_Coverage={float(val['Coverage']):.6f}",
+                flush=True,
+            )
 
         if stopper.step(float(val["NDCG"]), encoder, decoder, node_emb, epoch):
             break
 
     stopper.restore_best(encoder, decoder, node_emb)
     train_total_sec = time.perf_counter() - train_total_t0
+    avg_epoch_sec = float(train_total_sec) / float(max(int(epochs_ran), 1))
+
+    final_best_epoch = int(stopper.best_epoch if stopper.best_epoch >= 0 else best_epoch)
 
     return {
         "best_val_ndcg": float(best_val),
-        "best_epoch": int(stopper.best_epoch if stopper.best_epoch >= 0 else best_epoch),
+        "best_epoch": final_best_epoch,
+        "best_val_metrics": dict(best_val_metrics),
         "train_total_sec": float(train_total_sec),
+        "avg_epoch_sec": float(avg_epoch_sec),
+        "epochs_ran": float(epochs_ran),
         "node_emb": node_emb,
         "encoder": encoder,
         "decoder": decoder,
     }
+
 
 
 def main():
@@ -481,14 +499,13 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.2)
 
     parser.add_argument("--num-hops", type=int, default=2, help="GCN hops = number of GCNConv layers")
-    parser.add_argument("--embedding-dim", type=int, default=128,
-                        help="Same dimension for node_emb and GCN ")
+    parser.add_argument("--embedding-dim", type=int, default=128, help="Same dimension for node_emb and GCN")
     parser.add_argument("--bsize", type=int, default=1, help="DGDataLoader batch_size (in batch_unit units)")
 
     parser.add_argument(
         "--path-dataset",
         type=str,
-        default="data/movielens/ml-100k_ratings_tgm.csv",
+        default="data/movielens/ml-1m_ratings_tgm.csv",
         help="CSV with columns: from,to,timestamp (value optional)",
     )
     parser.add_argument("--raw-time-gran", type=str, default="s")
@@ -498,24 +515,34 @@ def main():
         default="h",
         help="time unit for batching events and snapshots (batch_unit)",
     )
-    parser.add_argument("--window-snapshots", type=int, default=1,
-                        help="sliding window size in number of snapshots")
+    parser.add_argument("--window-snapshots", type=int, default=24, help="sliding window size in number of snapshots")
 
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--ndcg-k", type=int, default=20)
-    parser.add_argument("--patience", type=int, default=2)
+    parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--min-delta", type=float, default=1e-4)
     parser.add_argument("--log-file-path", type=str, default=None)
 
-    parser.add_argument("--optuna-trials", type=int, default=0, help="If > 0, run Optuna with this number of trials")
+    parser.add_argument("--optuna-trials", type=int, default=50, help="If > 0, run Optuna with this number of trials")
     parser.add_argument("--optuna-study-name", type=str, default="tgm_optuna")
     parser.add_argument("--optuna-sampler-seed", type=int, default=1337)
 
     args = parser.parse_args()
 
-    enable_logging(log_file_path=args.log_file_path) # console
+    # Silence all library logs
+    handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if args.log_file_path:
+        handlers.append(logging.FileHandler(args.log_file_path))
+    logging.basicConfig(level=logging.ERROR, handlers=handlers, format="%(message)s")
+    for name in ["tgm", "tgm.data", "tgm.util", "torch_geometric", "optuna"]:
+        logging.getLogger(name).setLevel(logging.ERROR)
+    try:
+        optuna.logging.set_verbosity(optuna.logging.ERROR)
+    except Exception:
+        pass
+
     seed_everything(args.seed)
     device = torch.device(args.device)
 
@@ -586,17 +613,21 @@ def main():
         sampler = optuna.samplers.TPESampler(seed=int(args.optuna_sampler_seed))
         study = optuna.create_study(direction="maximize", study_name=str(args.optuna_study_name), sampler=sampler)
 
-        def objective(trial: optuna.Trial) -> float:
-            # emb_dim = int(trial.suggest_categorical("embedding_dim", [16, 32, 64, 128]))
-            # dropout = float(trial.suggest_float("dropout", 0.0, 0.5, step=0.1))
-            # lr = float(trial.suggest_float("lr", 1e-4, 3e-3, log=True))
-            # num_hops = int(trial.suggest_categorical("num_hops", [1, 2, 3]))
+        n_trials = int(args.optuna_trials)
 
-            # short test
-            emb_dim = int(trial.suggest_categorical("embedding_dim", [16, 32]))
-            dropout = float(trial.suggest_float("dropout", 0.0, 0.5, step=0.25))
-            lr = float(trial.suggest_float("lr", 1e-4, 2e-3, log=True))
-            num_hops = int(trial.suggest_categorical("num_hops", [1, 2]))
+        def objective(trial: optuna.Trial) -> float:
+            emb_dim = int(trial.suggest_categorical("embedding_dim", [16, 32, 64, 128]))
+            dropout = float(trial.suggest_float("dropout", 0.0, 0.5, step=0.1))
+            lr = float(trial.suggest_float("lr", 1e-4, 3e-3, log=True))
+            num_hops = int(trial.suggest_categorical("num_hops", [1, 2, 3]))
+
+            trial_prefix = f"[trial {trial.number + 1}/{n_trials}]"
+            print(f"\n===== TRIAL {trial.number + 1}/{n_trials} =====", flush=True)
+            print(
+                f"{trial_prefix} params: "
+                f"embedding_dim={emb_dim} num_hops={num_hops} dropout={dropout:.3f} lr={lr:.6g}",
+                flush=True,
+            )
 
             out = run_train_val(
                 seed=int(args.seed),
@@ -617,6 +648,19 @@ def main():
                 train_loader=train_loader,
                 val_loader=val_loader,
                 snapshots_loader=all_snapshots_loader,
+                log_prefix=trial_prefix,
+            )
+
+            bestm = out.get("best_val_metrics", {})
+            print(
+                f"{trial_prefix} BEST: "
+                f"best_epoch={int(out['best_epoch'])} "
+                f"best_val_NDCG={float(bestm.get('NDCG', out['best_val_ndcg'])):.6f} "
+                f"best_val_Coverage={float(bestm.get('Coverage', 0.0)):.6f} "
+                f"train_total_sec={float(out.get('train_total_sec', 0.0)):.2f} "
+                f"avg_epoch_sec={float(out.get('avg_epoch_sec', 0.0)):.3f} "
+                f"epochs_ran={int(float(out.get('epochs_ran', 0.0)))}",
+                flush=True,
             )
 
             trial.set_user_attr("best_epoch", int(out["best_epoch"]))
@@ -624,22 +668,17 @@ def main():
             return float(out["best_val_ndcg"])
 
         # optuna version compatibility (show_progress_bar may not exist)
-        study.optimize(objective, n_trials=int(args.optuna_trials), show_progress_bar=True)
+        try:
+            study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        except TypeError:
+            study.optimize(objective, n_trials=n_trials)
 
         best_params = study.best_params
         best_value = float(study.best_value)
 
-        print("\n===== OPTUNA BEST =====")
-        print("best_value (val NDCG):", best_value)
-        print("best_params:", best_params)
-
-        log_metric("Optuna Best Val NDCG", best_value, epoch=0)
-        for k, v in best_params.items():
-            # log as float where possible
-            # try:
-            log_metric(f"Optuna Best {k}", float(v), epoch=0)
-            # except Exception:
-            #     pass
+        print("\n===== OPTUNA BEST =====", flush=True)
+        print(f"best_value (val NDCG): {best_value:.6f}", flush=True)
+        print(f"best_params: {best_params}", flush=True)
 
         # final run with best params, then test
         out = run_train_val(
@@ -661,12 +700,24 @@ def main():
             train_loader=train_loader,
             val_loader=val_loader,
             snapshots_loader=all_snapshots_loader,
+            log_prefix=None,
+        )
+
+        bestm = out.get("best_val_metrics", {})
+        print("\n===== FINAL RUN (best params) =====", flush=True)
+        print(
+            f"best_epoch={int(out['best_epoch'])} "
+            f"val_NDCG={float(bestm.get('NDCG', out['best_val_ndcg'])):.6f} "
+            f"val_Coverage={float(bestm.get('Coverage', 0.0)):.6f} "
+            f"train_total_sec={float(out.get('train_total_sec', 0.0)):.2f} "
+            f"avg_epoch_sec={float(out.get('avg_epoch_sec', 0.0)):.3f} "
+            f"epochs_ran={int(float(out.get('epochs_ran', 0.0)))}",
+            flush=True,
         )
 
         encoder = out["encoder"]
         decoder = out["decoder"]
         node_emb = out["node_emb"]
-        best_epoch = int(out["best_epoch"])
 
         test = eval_metrics(
             test_loader,
@@ -681,98 +732,66 @@ def main():
             int(args.window_snapshots),
         )
 
-        log_metrics_dict({f"Test {k}": float(v) for k, v in test.items()}, epoch=best_epoch)
-        print("\n===== TEST (after selecting best hyperparams) =====")
-        print(test)
+        print("\n===== TEST (after selecting best hyperparams) =====", flush=True)
+        print(test, flush=True)
         return
 
     # single run mode (no optuna)
-    train_total_t0 = time.perf_counter()
-
-    node_emb = nn.Embedding(int(full_data.num_nodes), int(emb_dim_fixed)).to(device)
-    torch.nn.init.normal_(node_emb.weight, std=0.1)
-
-    encoder = GCNEncoder(
-        in_channels=int(emb_dim_fixed),
-        hidden_dim=int(emb_dim_fixed),
-        out_channels=int(emb_dim_fixed),
-        num_hops=int(args.num_hops),
-        dropout=float(args.dropout),
-    ).to(device)
-
-    decoder = DotProductDecoder().to(device)
-
-    opt = torch.optim.Adam(
-        list(encoder.parameters()) + list(decoder.parameters()) + list(node_emb.parameters()),
-        lr=float(args.lr),
+    print("===== SINGLE RUN (no Optuna) =====", flush=True)
+    print(
+        f"params: embedding_dim={emb_dim_fixed} num_hops={int(args.num_hops)} "
+        f"dropout={float(args.dropout):.3f} lr={float(args.lr):.6g}",
+        flush=True,
     )
 
-    stopper = EarlyStopper(patience=int(args.patience), min_delta=float(args.min_delta))
+    out = run_train_val(
+        seed=int(args.seed),
+        epochs=int(args.epochs),
+        patience=int(args.patience),
+        min_delta=float(args.min_delta),
+        lr=float(args.lr),
+        dropout=float(args.dropout),
+        num_hops=int(args.num_hops),
+        emb_dim=int(emb_dim_fixed),
+        window_snapshots=int(args.window_snapshots),
+        ndcg_k=int(args.ndcg_k),
+        device=device,
+        full_num_nodes=int(full_data.num_nodes),
+        conversion_rate=int(conversion_rate),
+        num_items=int(num_items),
+        item_offset=int(item_offset),
+        train_loader=train_loader,
+        val_loader=val_loader,
+        snapshots_loader=all_snapshots_loader,
+        log_prefix="[single]",
+    )
 
-    for epoch in range(1, int(args.epochs) + 1):
-        epoch_t0 = time.perf_counter()
-
-        loss = train_epoch(
-            train_loader,
-            all_snapshots_loader,
-            encoder,
-            decoder,
-            node_emb,
-            opt,
-            conversion_rate,
-            num_items,
-            item_offset,
-            int(args.window_snapshots),
-        )
-
-        val = eval_metrics(
-            val_loader,
-            all_snapshots_loader,
-            encoder,
-            decoder,
-            node_emb,
-            conversion_rate,
-            num_items,
-            item_offset,
-            int(args.ndcg_k),
-            int(args.window_snapshots),
-        )
-
-        epoch_sec = time.perf_counter() - epoch_t0
-
-        log_metric("Epoch time (sec)", float(epoch_sec), epoch=epoch)
-        log_metric("Loss", float(loss), epoch=epoch)
-        log_metric("Validation NDCG", float(val["NDCG"]), epoch=epoch)
-        log_metric("Validation Coverage", float(val["Coverage"]), epoch=epoch)
-
-        if stopper.step(float(val["NDCG"]), encoder, decoder, node_emb, epoch):
-            log_metric("EarlyStop", 1.0, epoch=epoch)
-            break
-
-    stopper.restore_best(encoder, decoder, node_emb)
-    best_epoch = stopper.best_epoch if stopper.best_epoch >= 0 else epoch
-
-    train_total_sec = time.perf_counter() - train_total_t0
-    epochs_ran = int(epoch)
-    avg_epoch_sec = float(train_total_sec) / float(max(1, epochs_ran))
-
-    log_metric("Train total time (sec)", float(train_total_sec), epoch=best_epoch)
-    log_metric("Avg epoch time (sec)", float(avg_epoch_sec), epoch=best_epoch)
-    log_metric("Epochs ran", float(epochs_ran), epoch=best_epoch)
+    bestm = out.get("best_val_metrics", {})
+    print(
+        f"[single] BEST: best_epoch={int(out['best_epoch'])} "
+        f"best_val_NDCG={float(bestm.get('NDCG', out['best_val_ndcg'])):.6f} "
+        f"best_val_Coverage={float(bestm.get('Coverage', 0.0)):.6f} "
+        f"train_total_sec={float(out.get('train_total_sec', 0.0)):.2f} "
+        f"avg_epoch_sec={float(out.get('avg_epoch_sec', 0.0)):.3f} "
+        f"epochs_ran={int(float(out.get('epochs_ran', 0.0)))}",
+        flush=True,
+    )
 
     test = eval_metrics(
         test_loader,
         all_snapshots_loader,
-        encoder,
-        decoder,
-        node_emb,
+        out["encoder"],
+        out["decoder"],
+        out["node_emb"],
         conversion_rate,
         num_items,
         item_offset,
         int(args.ndcg_k),
         int(args.window_snapshots),
     )
-    log_metrics_dict({f"Test {k}": float(v) for k, v in test.items()}, epoch=best_epoch)
+
+    print("\n===== TEST =====", flush=True)
+    print(test, flush=True)
 
 
 if __name__ == "__main__":
