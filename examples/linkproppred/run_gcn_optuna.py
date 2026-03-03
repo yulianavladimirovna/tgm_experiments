@@ -307,7 +307,9 @@ def eval_metrics(
             batch.edge_src, batch.edge_dst, batch.edge_time, item_offset
         )
 
-        users_z = z[users_global]            # [U, d]
+        users = users_global.to(torch.long)
+
+        users_z = z[users]           # [U, d]
         items_z = z[item_ids_global]         # [I, d]
         logits = decoder(users_z, items_z)   # [U, I]
 
@@ -320,10 +322,10 @@ def eval_metrics(
         ndcg_batch = torch.zeros_like(rank, dtype=torch.float32, device=device)
         ndcg_batch[hit] = 1.0 / torch.log2(rank[hit].to(torch.float32) + 2.0)
 
-        ndcg_sum.scatter_add_(0, users_global, ndcg_batch)
-        ndcg_cnt.scatter_add_(0, users_global, torch.ones_like(ndcg_batch))
+        ndcg_sum.scatter_add_(0, users, ndcg_batch)
+        ndcg_cnt.scatter_add_(0, users, torch.ones_like(ndcg_batch))
 
-        last_topk[users_global] = topk_idx
+        last_topk[users] = topk_idx
 
     mask = ndcg_cnt > 0
     if mask.any():
