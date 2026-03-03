@@ -255,11 +255,17 @@ def eval_metrics(
     node_feat = node_emb.weight
 
     k_eff = int(k)
+    num_users = int(item_offset)
 
     item_ids_global = torch.arange(
         int(item_offset), int(item_offset + num_items),
         device=device, dtype=torch.long
     )
+
+    ndcg_sum = torch.zeros(num_users, device=device, dtype=torch.float32)
+    ndcg_cnt = torch.zeros(num_users, device=device, dtype=torch.float32)
+
+    last_topk = torch.full((num_users, k_eff), -1, device=device, dtype=torch.long)
 
     snapshots_iter = iter(snapshots_loader)
     next_snapshot = None
@@ -270,9 +276,6 @@ def eval_metrics(
     prefix_batch = _update_window_prefix(deque(), device=device)
     z = encoder(prefix_batch, node_feat)
     prev_prefix_sig = (0, -1)
-
-    ndcg_by_user: Dict[int, List[float]] = defaultdict(list)
-    topk_by_user: Dict[int, torch.Tensor] = {}
 
     for batch in loader:
         batch_start = int(batch.edge_time.min().item())
@@ -304,34 +307,37 @@ def eval_metrics(
             batch.edge_src, batch.edge_dst, batch.edge_time, item_offset
         )
 
-        users_z = z[users_global]
-        items_z = z[item_ids_global]
-        logits = decoder(users_z, items_z)
+        users_z = z[users_global]            # [U, d]
+        items_z = z[item_ids_global]         # [I, d]
+        logits = decoder(users_z, items_z)   # [U, I]
 
-        topk_idx = torch.topk(logits, k=k_eff, dim=1, largest=True).indices  # [U, k] (local item ids)
+        topk_idx = torch.topk(logits, k=k_eff, dim=1, largest=True).indices  # [U, k]
 
-        for row in range(int(users_global.numel())):
-            u = int(users_global[row].item())
-            pos = int(pos_items_local[row].item())
-            hits = (topk_idx[row] == pos).nonzero(as_tuple=False)
-            if hits.numel() == 0:
-                ndcg = 0.0
-            else:
-                rank = int(hits[0].item())
-                ndcg = 1.0 / float(np.log2(rank + 2.0))
-            ndcg_by_user[u].append(float(ndcg))
+        # NDCG@k векторно
+        match = (topk_idx == pos_items_local.view(-1, 1))
+        hit = match.any(dim=1)  # [U]
+        rank = match.float().argmax(dim=1)  # [U], 0..k-1
+        ndcg_batch = torch.zeros_like(rank, dtype=torch.float32, device=device)
+        ndcg_batch[hit] = 1.0 / torch.log2(rank[hit].to(torch.float32) + 2.0)
 
-            topk_by_user[u] = topk_idx[row].detach()
+        ndcg_sum.scatter_add_(0, users_global, ndcg_batch)
+        ndcg_cnt.scatter_add_(0, users_global, torch.ones_like(ndcg_batch))
 
-    user_means = [float(np.mean(v)) for v in ndcg_by_user.values()]
-    ndcg = float(np.mean(user_means)) if len(user_means) else 0.0
+        last_topk[users_global] = topk_idx
 
-    if len(topk_by_user) == 0:
+    mask = ndcg_cnt > 0
+    if mask.any():
+        user_means = ndcg_sum[mask] / ndcg_cnt[mask]
+        ndcg = float(user_means.mean().item())
+    else:
+        ndcg = 0.0
+
+    valid = last_topk.view(-1)
+    valid = valid[valid >= 0]
+    if valid.numel() == 0:
         coverage = 0.0
     else:
-        all_topk = torch.cat([t.view(-1) for t in topk_by_user.values()], dim=0)
-        covered = int(torch.unique(all_topk).numel())
-        coverage = float(covered) / float(max(1, int(num_items)))
+        coverage = float(torch.unique(valid).numel()) / float(max(1, int(num_items)))
 
     return {"NDCG": ndcg, "Coverage": coverage}
 
